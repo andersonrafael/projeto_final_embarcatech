@@ -1,418 +1,190 @@
-# Display OLED
+# 🔭 BitDogLab — Sistema de Monitoramento com Sensor de Distância Laser
 
-## Atividade: Configurando e Usando o Display OLED da BitDogLab com Linguagem C
+Sistema embarcado para a placa **BitDogLab (Raspberry Pi Pico W)** que monitora distância e inclinação em tempo real, exibe os dados em um display OLED e publica as leituras via **MQTT no broker HiveMQ** usando **FreeRTOS**.
 
-A seguir, apresentaremos um passo a passo para configurar e programar o Display OLED da BitDogLab utilizando a linguagem C. Vamos criar um programa que escreve uma mensagem no display, explorando as funções básicas de inicialização, configuração e manipulação de texto.
+---
 
-### Objetivo:
+## 📋 Funcionalidades
 
-Desenvolver um programa que configure o Display OLED da BitDogLab e exiba uma mensagem personalizada. O programa deve inicializar a comunicação com o display, configurar os parâmetros de operação e atualizar a tela com a mensagem desejada.
+- **Sensor de distância laser VL53L0X** — leitura em milímetros via I2C
+- **Sensor inercial MPU6050** — leitura de inclinação em graus via I2C
+- **Display OLED SSD1306** — exibe distância, inclinação, barra de proximidade e status MQTT
+- **LEDs NeoPixel WS2812 (5x5)** — indicação visual de estado (verde/laranja/vermelho)
+- **Buzzer PWM** — alertas sonoros para colisão e inclinação excessiva
+- **Botão A** — toggle de silenciar/ativar os LEDs (via interrupção de hardware)
+- **Wi-Fi + MQTT HiveMQ** — publicação dos dados a cada 5 segundos no broker público
+- **FreeRTOS** — arquitetura multitask com queue de dados entre tasks
 
-### Desenvolvimento:
+---
 
-**Passo 1:** Configuração do Ambiente
+## 🏗️ Arquitetura de Software
 
-Antes de iniciar a programação, certifique-se de que o ambiente de desenvolvimento está configurado:
+O sistema é dividido em **4 tasks FreeRTOS** que se comunicam por uma **queue** central:
 
-- Conecte a BitDogLab ao computador utilizando um cabo USB.
-- Abra o VS Code e carregue o projeto com a estrutura de pastas para compilar e executar código em C na BitDogLab.
-- Verifique se as bibliotecas necessárias estão instaladas:
-  - [ssd1306.h](https://github.com/BitDogLab/BitDogLab-C/blob/main/display_oled/inc/ssd1306.h) para reconhecer as funções do código C. OBS: Esta biblioteca está disponível no link ativo.
-  - [ssd1306 font.h](https://github.com/BitDogLab/BitDogLab-C/blob/main/display_oled/inc/ssd1306_font.h) para obter os desenhos no display para cada caractere singular. Disponível no link ativo.
-  - [ssd1306_i2c.h](https://github.com/BitDogLab/BitDogLab-C/blob/main/display_oled/inc/ssd1306_i2c.h) para controlar o Display OLED. Disponível no link ativo.
-  - [ssd1306_i2c.c](https://github.com/BitDogLab/BitDogLab-C/blob/main/display_oled/inc/ssd1306_i2c.c) para declarar as funções ativas do código C. Disponível no link ativo.
-  - Certifique-se de incluir os arquivos ssd1306.h, ssd1306_font.h, ssd1306_i2c.h e ssd1306_i2c.c numa pasta separada (de nome “inc”) dentro do projeto.
-  - Drivers para comunicação I2C.
-
-**Passo 2:** Entendimento da Configuração do Hardware
-
-- O Display OLED está conectado ao barramento I2C da BitDogLab através dos seguintes pinos:
-  - SDA: GPIO14
-  - SCL: GPIO15
-- O endereço do Display OLED é 0x3C.
-
-**Passo 3:** Escrevendo o Código
-
-- Inicialização do I2C e do Display OLED – Inclua as bibliotecas necessárias e inicialize a comunicação com o display:
-
-```c
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include "pico/stdlib.h"
-#include "pico/binary_info.h"
-#include "inc/ssd1306.h"
-#include "hardware/i2c.h"
-
-const uint I2C_SDA = 14;
-const uint I2C_SCL = 15;
-
-int main()
-{
-    stdio_init_all();   // Inicializa os tipos stdio padrão presentes ligados ao binário
-
-    // Inicialização do i2c
-    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
-
-    // Processo de inicialização completo do OLED SSD1306
-    ssd1306_init();
-
-    // Preparar área de renderização para o display (ssd1306_width pixels por ssd1306_n_pages páginas)
-    struct render_area frame_area = {
-        start_column : 0,
-        end_column : ssd1306_width - 1,
-        start_page : 0,
-        end_page : ssd1306_n_pages - 1
-    };
-
-    calculate_render_area_buffer_length(&frame_area);
-
-    // zera o display inteiro
-    uint8_t ssd[ssd1306_buffer_length];
-    memset(ssd, 0, ssd1306_buffer_length);
-    render_on_display(ssd, &frame_area);
-
-restart:
+```
+main()
+  └─ vInitTask (prioridade 2) — inicializa hardware, Wi-Fi e MQTT; se auto-deleta
+       │
+       ├─ vSensorTask  (prioridade 3) — lê VL53L0X + MPU6050 a cada 100ms
+       │    └─ publica SensorData_t na xSensorQueue
+       │
+       ├─ vDisplayTask (prioridade 2) — consome queue → display + LEDs + buzzer
+       │
+       └─ vMqttTask    (prioridade 1) — consome queue → publica no HiveMQ a cada 5s
 ```
 
-- Exibição de Mensagem no Display – Crie uma função para escrever texto no Display OLED (no arquivo ssd1306_i2c.c) e chame-a no código principal:
+O **botão A** é tratado por **interrupção de GPIO** (não polling), garantindo resposta imediata independente das tasks.
 
-```c
-// Desenha uma string, chamando a função de desenhar caractere várias vezes
+---
 
-void ssd1306_draw_string(uint8_t *ssd, int16_t x, int16_t y, char *string) {
-    if (x > ssd1306_width - 8 || y > ssd1306_height - 8) {
-        return;
-    }
+## 📁 Estrutura de Arquivos
 
-    while (*string) {
-        ssd1306_draw_char(ssd, x, y, *string++);
-        x += 8;
-    }
-}
+```
+sensor_distancia_laser/
+├── laser_distance.c        # Código principal (tasks, MQTT, sensores)
+├── CMakeLists.txt          # Build system
+├── FreeRTOSConfig.h        # Configuração do FreeRTOS (heap 128KB)
+├── lwipopts.h              # Configuração do lwIP (OBRIGATÓRIO para MQTT)
+├── ws2812.pio              # Programa PIO para LEDs WS2812
+├── mpu6050/
+│   ├── mpu6050.c
+│   └── mpu6050.h
+├── ssd1306.c               # Driver display OLED
+├── display.c               # Funções de alto nível do display
+└── display.h
 ```
 
-```c
-char *text[] = {
-        "  Bem-vindos!   ",
-        "  Embarcatech   "};
+---
 
-    int y = 0;
-    for (uint i = 0; i < count_of(text); i++)
-    {
-        ssd1306_draw_string(ssd, 5, y, text[i]);
-        y += 8;
-    }
-    render_on_display(ssd, &frame_area);
+## 🔧 Hardware Necessário
 
-    while(true) {
-        sleep_ms(1000);
-    }
+| Componente | Conexão |
+|---|---|
+| Raspberry Pi Pico W (BitDogLab) | — |
+| Sensor laser VL53L0X | I2C0: SDA=GP0, SCL=GP1 |
+| IMU MPU6050 | I2C0: SDA=GP0, SCL=GP1 |
+| Display OLED SSD1306 | I2C0: SDA=GP0, SCL=GP1 |
+| LEDs NeoPixel WS2812 5x5 | GP7 |
+| Buzzer | GP21 (PWM) |
+| Botão A | GP5 (pull-up interno) |
 
-    return 0;
-}
-```
+---
 
-O código completo pode ser acessado [neste link](https://github.com/BitDogLab/BitDogLab-C/blob/main/display_oled/display_oled.c).
+## ⚙️ Configuração
 
-**Passo 4:** Compilação e Execução
+### 1. Credenciais Wi-Fi
 
-- Compile o código no VS Code.
-- Carregue o programa na BitDogLab.
-- Observe a mensagem "Bem-vindos!" e "Embarcatech" no Display OLED.
-
-### Exploração Adicional:
-
-- Modifique a mensagem para exibir seu nome ou outro texto personalizado.
-- Experimente mudar a posição do texto no display ajustando os valores de x e y.
-- Tente adicionar animações simples, como rolagem de texto ou texto piscando.
-
-### Dica Importante:
-
-Sempre chame a função render_on_display após modificar o buffer do display para garantir que as alterações sejam exibidas.
-
-## Atividade: Desenhando Linhas no Display OLED da BitDogLab com o Algoritmo de Bresenham
-
-Nesta atividade, exploraremos como desenhar linhas no Display OLED da BitDogLab utilizando a linguagem C. Para isso, aplicaremos o algoritmo de Bresenham, amplamente usado em sistemas gráficos por sua eficiência no cálculo de pontos de uma linha reta.
-
-### Objetivo:
-
-- Compreender como um algoritmo pode ser implementado para trabalhar com gráficos baseados em pixels.
-- Aprender a manipular pixels no Display OLED.
-- Estimular o raciocínio matemático aplicado à programação.
-
-Esta atividade é ideal para introduzir conceitos de gráficos computacionais e controle de hardware gráfico.
-
-### Desenvolvimento:
-
-**Passo 1:** Função do Algoritmo de Bresenham
-
-O algoritmo de Bresenham calcula os pontos de uma linha entre dois pontos cartesianos (x_0, y_0) e (x_1, y_1) e acende os pixels correspondentes no display.
+Edite as linhas no topo de `laser_distance.c`:
 
 ```c
-// Função do Algoritmo de Bresenham
-void ssd1306_draw_line(uint8_t *ssd, int x_0, int y_0, int x_1, int y_1, bool set) {
-    int dx = abs(x_1 - x_0); // Deslocamentos
-    int dy = -abs(y_1 - y_0);
-    int sx = x_0 < x_1 ? 1 : -1; // Direção de avanço
-    int sy = y_0 < y_1 ? 1 : -1;
-    int error = dx + dy; // Erro acumulado
-    int error_2;
-
-    while (true) {
-        ssd1306_set_pixel(ssd, x_0, y_0, set); // Acende pixel no ponto atual
-        if (x_0 == x_1 && y_0 == y_1) {
-            break; // Verifica se o ponto final foi alcançado
-        }
-
-        error_2 = 2 * error; // Ajusta o erro acumulado
-
-        if (error_2 >= dy) {
-            error += dy;
-            x_0 += sx; // Avança na direção x
-        }
-        if (error_2 <= dx) {
-            error += dx;
-            y_0 += sy; // Avança na direção y
-        }
-    }
-}
+#define WIFI_SSID       "SEU_WIFI_AQUI"
+#define WIFI_PASSWORD   "SUA_SENHA_AQUI"
 ```
 
-<details>
+### 2. MQTT
 
-<summary>Comentários do Código</summary>
-  
-### Explicando as variáveis:
-
-- dx e dy: Distâncias absolutas em cada eixo, definindo a inclinação da linha.
-- sx e sy: Direção de movimento nos eixos x e y, dependendo do ponto inicial e final.
-- Erro acumulado (error): Usado para decidir se o próximo ponto avança no eixo principal ou secundário.
-- Chamada de ssd1306_set_pixel: Marca cada ponto da linha no buffer do display.
-</details>
-
-**Passo 2:** Programa Principal
-
-Este programa utiliza a função de Bresenham para desenhar uma linha no display, conectando os pontos (10, 10) e (100, 50).
+O broker usado é o **HiveMQ público** (sem autenticação, sem TLS):
 
 ```c
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include "pico/stdlib.h"
-#include "pico/binary_info.h"
-#include "inc/ssd1306.h"
-#include "hardware/i2c.h"
-
-const uint I2C_SDA = 14;
-const uint I2C_SCL = 15;
-
-int main()
-{
-    stdio_init_all();   // Inicializa os tipos stdio padrão presentes ligados ao binário
-
-    // Inicialização do i2c
-    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
-
-    // Processo de inicialização completo do OLED SSD1306
-    ssd1306_init();
-
-    // Preparar área de renderização para o display (ssd1306_width pixels por ssd1306_n_pages páginas)
-    struct render_area frame_area = {
-        start_column : 0,
-        end_column : ssd1306_width - 1,
-        start_page : 0,
-        end_page : ssd1306_n_pages - 1
-    };
-
-    calculate_render_area_buffer_length(&frame_area);
-
-    // zera o display inteiro
-    uint8_t ssd[ssd1306_buffer_length];
-    memset(ssd, 0, ssd1306_buffer_length);
-    render_on_display(ssd, &frame_area);
-
-restart:
-
-    ssd1306_draw_line(ssd, 10, 10, 100, 50, true);
-    render_on_display(ssd, &frame_area);
-
-    while(true) {
-        sleep_ms(1000);
-    }
-
-    return 0;
-}
+#define MQTT_BROKER     "broker.hivemq.com"
+#define MQTT_BROKER_PORT 1883
+#define MQTT_CLIENT_ID  "bitdoglab_pico_001"  // deve ser único por dispositivo
 ```
 
-<details>
+> ⚠️ Se houver mais de um dispositivo na rede com o mesmo `MQTT_CLIENT_ID`, eles vão se desconectar mutuamente. Altere o ID conforme necessário.
 
-<summary>Comentários do Código</summary>
+---
 
-### Explicando cada parte:
+## 📡 Tópicos MQTT
 
-- Inicialização do I2C:
-  - Configura a comunicação I2C no barramento correto (SDA: GPIO14, SCL: GPIO15).
-  - Ajusta a velocidade para 400 kHz.
-- Inicialização do Display OLED:
-  - Usa ssd1306_init para preparar o display.
-- Chamada de ssd1306_draw_line:
-  - Desenha a linha no buffer usando a função de Bresenham.
-- Atualização do Display:
-  - Chama render_on_display para exibir os dados do buffer no hardware.
+| Tópico | Conteúdo | Exemplo |
+|---|---|---|
+| `bitdoglab/distancia` | Distância em mm | `342` |
+| `bitdoglab/inclinacao` | Inclinação em graus | `12.5` |
+| `bitdoglab/alerta` | JSON com estado dos alertas | `{"colisao":0,"inclinacao":1}` |
+| `bitdoglab/leds` | Estado dos LEDs | `ativo` ou `mute` |
+| `bitdoglab/status` | Status do dispositivo | `online` / `offline` (LWT) |
 
-</details>
+### Monitorar no navegador
 
-### Exploração Adicional:
+Acesse [hivemq.com/demos/websocket-client](http://www.hivemq.com/demos/websocket-client/), conecte ao broker `broker.hivemq.com` na porta `8000` (WebSocket) e inscreva-se nos tópicos `bitdoglab/#`.
 
-- Desenhe múltiplas linhas para criar figuras geométricas, como triângulos ou retângulos.
-- Modifique os pontos de início e fim para explorar diferentes inclinações de linhas.
-- Use botões ou um joystick para desenhar linhas interativamente no display.
+---
 
-### Dica Importante:
+## 🚨 Lógica de Alertas
 
-Lembre-se de sempre chamar a função render_on_display após modificar o buffer para que as alterações sejam exibidas no display.
+| Condição | LED | Buzzer | Display |
+|---|---|---|---|
+| Normal | 🟢 Verde | Silencioso | — |
+| Distância < 100mm | 🔴 Vermelho | Tom agudo (PWM 2000) | `! COLISAO !` |
+| Inclinação > 70° ou < -70° | 🟠 Laranja | Tom médio (PWM 1000) | `! INCLINACAO !` |
+| LEDs silenciados (botão A) | ⚫ Desligado | — | `MODO MUTE` |
 
-## Atividade: Exibindo Bitmaps no Display OLED da BitDogLab
+---
 
-Nesta atividade, vamos aprender a exibir uma imagem monocromática no Display OLED presente na BitDogLab. As imagens serão importadas como bitmaps no formato 128x64, adequado para a resolução do display. Essa atividade é uma excelente oportunidade para entender como gráficos são manipulados em dispositivos embarcados.
+## 🛠️ Compilação
 
-Para representar um bitmap monocromático no Display OLED, precisamos traduzir a imagem para uma matriz de bytes. Cada byte da matriz representa uma coluna de 8 pixels (uma "página" vertical) no display, seguindo o modelo de mapeamento do controlador SSD1306. Este formato compacto e eficiente permite que gráficos sejam exibidos diretamente no hardware.
+### Pré-requisitos
 
-A seguir, apresentaremos um guia detalhado que inclui:
+- [Pico SDK 2.2.0](https://github.com/raspberrypi/pico-sdk)
+- [FreeRTOS Kernel](https://github.com/FreeRTOS/FreeRTOS-Kernel)
+- CMake 3.13+
+- ARM GCC Toolchain 14.2
 
-- Como criar ou converter imagens para o formato 128x64 monocromático.
-- Como estruturar e integrar a matriz de bytes no código.
-- Como exibir o bitmap no Display OLED utilizando linguagem C.
+### Build
 
-Ao final, você será capaz de importar e exibir imagens personalizadas no display, explorando novas possibilidades para suas aplicações gráficas embarcadas!
+```bash
+# Delete o cache do CMake antes de recompilar (importante após mudanças no lwipopts.h)
+rm -rf build/
 
-### Desenvolvimento:
-
-**Passo 1:** Converter a Imagem para Bitmap
-
-- Use uma ferramenta gráfica (como GIMP ou um conversor online) para criar ou editar uma imagem de 128x64 pixels.
-- Exporte a imagem no formato monocromático (1-bit, preto e branco) e salve-a como uma matriz de bytes.
-- O resultado será uma matriz de bytes em formato hexadecimal, onde cada bit representa um pixel (1 para ligado, 0 para desligado).
-
-Exemplo de matriz de bitmap (imagem simples):
-
-```c
-const uint8_t bitmap_128x64[] = {
-    0xFF, 0x81, 0x81, 0xFF,  // Padrão de quadrado (exemplo)
-    0x81, 0x81, 0x81, 0xFF,  // Continuação do padrão
-    // Adicione mais linhas para completar 128x64
-};
+mkdir build && cd build
+cmake ..
+make -j4
 ```
 
-![Figura](images/bitmap_info.png)
+O arquivo `laser_distance.uf2` será gerado em `build/`.
 
-**Passo 2:** Código para Renderizar o Bitmap no Display OLED
+### Gravação
 
-- Função para Desenhar o Bitmap – Crie uma função que copie os dados do bitmap para o buffer do display.
+1. Segure o botão **BOOTSEL** da BitDogLab e conecte o USB
+2. Arraste o arquivo `laser_distance.uf2` para a unidade `RPI-RP2` que aparecer
+3. A placa reinicia automaticamente
 
-```c
-void ssd1306_draw_bitmap(ssd1306_t *ssd, const uint8_t *bitmap) {
-    // Copia o bitmap para o buffer do display
-    for (int i = 0; i < ssd->bufsize - 1; i++) {
-        ssd->ram_buffer[i + 1] = bitmap[i]; // O buffer começa no índice 1
-    }
-    // Atualiza o display com os dados do buffer
-    ssd1306_send_data(ssd);
-}
+### Monitor serial
+
+```bash
+# Linux/Mac
+minicom -b 115200 -D /dev/ttyACM0
+
+# Windows — use PuTTY ou o monitor serial do VS Code (115200 baud)
 ```
 
-- Programa Principal – Use a função ssd1306_draw_bitmap para carregar e exibir o bitmap no display.
+---
 
-```c
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-#include <ctype.h>
-#include "pico/stdlib.h"
-#include "pico/binary_info.h"
-#include "inc/ssd1306.h"
-#include "hardware/i2c.h"
+## 🐞 Solução de Problemas
 
-const uint I2C_SDA = 14;
-const uint I2C_SCL = 15;
+| Sintoma | Causa provável | Solução |
+|---|---|---|
+| `*** PANIC *** size > 0` | `lwipopts.h` ausente ou incorreto | Confirme que `lwipopts.h` está na raiz do projeto |
+| `MEMP_SYS_TIMEOUT is empty` | Poucos slots de timeout no lwIP | Verifique `MEMP_NUM_SYS_TIMEOUT 16` no `lwipopts.h` |
+| LED não pisca, serial vazio | `cyw43_arch_init()` chamado fora do FreeRTOS | `cyw43_arch_init()` deve ser chamado dentro de uma task |
+| Botão A não responde | — | O botão usa interrupção de GPIO; confirme que `gpio_set_irq_enabled_with_callback` foi chamado na init |
+| MQTT não conecta | DNS falhou ou Wi-Fi instável | Verifique SSID/senha e aguarde as mensagens de reconexão no serial |
+| `MQTT_PORT redefined` | Conflito com define interno do lwIP | Use `MQTT_BROKER_PORT` em vez de `MQTT_PORT` |
 
-int main()
-{
-    stdio_init_all();   // Inicializa os tipos stdio padrão presentes ligados ao binário
+---
 
-    // Inicialização do i2c
-    i2c_init(i2c1, ssd1306_i2c_clock * 1000);
-    gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_SDA);
-    gpio_pull_up(I2C_SCL);
+## 📦 Dependências
 
-    // Processo de inicialização completo do OLED SSD1306
-    ssd1306_init();
+| Biblioteca | Versão | Uso |
+|---|---|---|
+| Pico SDK | 2.2.0 | Base do hardware |
+| FreeRTOS Kernel | 202107+ | Multitasking |
+| lwIP | (incluso no SDK) | TCP/IP + DNS + MQTT |
+| pico_cyw43_arch_lwip_sys_freertos | (incluso no SDK) | Wi-Fi integrado ao FreeRTOS |
 
-    // Preparar área de renderização para o display (ssd1306_width pixels por ssd1306_n_pages páginas)
-    struct render_area frame_area = {
-        start_column : 0,
-        end_column : ssd1306_width - 1,
-        start_page : 0,
-        end_page : ssd1306_n_pages - 1
-    };
+---
 
-    calculate_render_area_buffer_length(&frame_area);
+## 📝 Licença
 
-    // zera o display inteiro
-    uint8_t ssd[ssd1306_buffer_length];
-    memset(ssd, 0, ssd1306_buffer_length);
-    render_on_display(ssd, &frame_area);
-
-restart:
-
-    const uint8_t bitmap_128x64[] = {
-        0xFF, 0x81, 0x81, 0xFF,  // Padrão de quadrado (exemplo)
-        0x81, 0x81, 0x81, 0xFF,  // Continuação do padrão
-        // Adicione mais linhas para completar 128x64
-        };
-
-    ssd1306_t ssd_bm;
-    ssd1306_init_bm(&ssd_bm, 128, 64, false, 0x3C, i2c1);
-    ssd1306_config(&ssd_bm);
-
-    ssd1306_draw_bitmap(&ssd_bm, bitmap_128x64);
-
-    while(true) {
-        sleep_ms(1000);
-    }
-
-    return 0;
-}
-```
-
-**Passo 3:** Como Testar
-
-- Carregue o Programa: Compile o código e envie para a BitDogLab usando seu ambiente de desenvolvimento.
-- Verifique a Imagem: A imagem definida no bitmap_128x64 será exibida no Display OLED.
-
-### Dicas Adicionais:
-
-- Ferramenta para Gerar Bitmaps:
-  - Use o GIMP:
-    - Crie uma imagem de 128x64 pixels.
-    - Exporta como .xbm (C header file). O GIMP gera automaticamente um array de bytes para incluir no código.
-- Formato de tamanho:
-  - Certifique-se de que o tamanho do array seja exatamente 128x64 / 8 = 1024 bytes.
-
-### Exploração Adicional:
-
-- Combine a exibição de bitmaps com outras funções, como desenhar texto ou linhas, para criar interfaces gráficas dinâmicas.
-- Com isso, você terá uma forma eficiente de exibir bitmaps no Display OLED da BitDogLab usando C!
+Projeto acadêmico — EmbarcaTech. Livre para uso educacional.
